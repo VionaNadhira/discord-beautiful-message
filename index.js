@@ -1,6 +1,9 @@
 require("dotenv").config();
 
 const {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   ChannelSelectMenuBuilder,
   ChannelType,
   Client,
@@ -32,9 +35,13 @@ if (!TOKEN || !CLIENT_ID) {
 }
 
 const COMMAND_NAME = "beautiful-message";
-const MODAL_ID = "beautiful-message-builder";
+const MODAL_PREFIX = "bm_modal:";
+const NEW_REF = "new";
+const SEND_PREFIX = "bm_send:";
+const EDIT_PREFIX = "bm_edit:";
+const DRAFT_TTL_MS = 14 * 60 * 1000;
 const ACCENT_COLOR = 0x5865f2;
-const PING_TEXT = "@everyone";
+const FALLBACK_PING = "@everyone";
 const PING_PATTERN = /(?<![\w/])@(everyone|here)\b/i;
 const MAX_TOTAL_TEXT = 4000;
 const MAX_BODY_LENGTH = 4000;
@@ -52,72 +59,130 @@ const IDS = {
   bannerUrl: "bannerUrl",
 };
 
+/** Draft pratinjau, key = interaction id, value = { userId, guildId, channelId, text, bannerUrl } */
+const drafts = new Map();
+
+class UserFacingError extends Error {}
+
 const beautifulMessage = new SlashCommandBuilder()
   .setName(COMMAND_NAME)
   .setDescription("Buka builder untuk mengirim pesan cantik dengan banner opsional.")
   .setDMPermission(false)
   .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages);
 
-class UserFacingError extends Error {}
+function buildModal(ref, draft = null) {
+  const channelMenu = new ChannelSelectMenuBuilder()
+    .setCustomId(IDS.postChannel)
+    .setPlaceholder("Select channel to post in")
+    .setChannelTypes(TARGET_CHANNEL_TYPES)
+    .setMinValues(1)
+    .setMaxValues(1)
+    .setRequired(true);
 
-function buildModal() {
+  if (draft?.channelId) channelMenu.setDefaultChannels(draft.channelId);
+
   const postChannel = new LabelBuilder()
     .setLabel("Post Channel")
     .setDescription("Choose the channel where the beautiful message will be posted.")
-    .setChannelSelectMenuComponent(
-      new ChannelSelectMenuBuilder()
-        .setCustomId(IDS.postChannel)
-        .setPlaceholder("Select channel to post in")
-        .setChannelTypes(TARGET_CHANNEL_TYPES)
-        .setMinValues(1)
-        .setMaxValues(1)
-        .setRequired(true),
-    );
+    .setChannelSelectMenuComponent(channelMenu);
 
-  const messageBody = new LabelBuilder()
-    .setLabel("Message Body")
-    .setTextInputComponent(
-      new TextInputBuilder()
-        .setCustomId(IDS.messageBody)
-        .setStyle(TextInputStyle.Paragraph)
-        .setPlaceholder("Share the announcement, promotion, or story...")
-        .setMaxLength(MAX_BODY_LENGTH)
-        .setRequired(true),
-    );
+  const bodyInput = new TextInputBuilder()
+    .setCustomId(IDS.messageBody)
+    .setStyle(TextInputStyle.Paragraph)
+    .setPlaceholder("Share the announcement, promotion, or story...")
+    .setMaxLength(MAX_BODY_LENGTH)
+    .setRequired(true);
 
-  const bannerUrl = new LabelBuilder()
-    .setLabel("Banner Image URL")
-    .setTextInputComponent(
-      new TextInputBuilder()
-        .setCustomId(IDS.bannerUrl)
-        .setStyle(TextInputStyle.Short)
-        .setPlaceholder("https://example.com/cover.png")
-        .setMaxLength(MAX_URL_LENGTH)
-        .setRequired(false),
-    );
+  if (draft) bodyInput.setValue(draft.text);
+
+  const messageBody = new LabelBuilder().setLabel("Message Body").setTextInputComponent(bodyInput);
+
+  const bannerInput = new TextInputBuilder()
+    .setCustomId(IDS.bannerUrl)
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder("https://example.com/cover.png")
+    .setMaxLength(MAX_URL_LENGTH)
+    .setRequired(false);
+
+  if (draft?.bannerUrl) bannerInput.setValue(draft.bannerUrl);
+
+  const bannerUrl = new LabelBuilder().setLabel("Banner Image URL").setTextInputComponent(bannerInput);
 
   return new ModalBuilder()
-    .setCustomId(MODAL_ID)
+    .setCustomId(`${MODAL_PREFIX}${ref}`)
     .setTitle("Beautiful Message Builder")
     .addComponents(postChannel, messageBody, bannerUrl);
 }
 
-function buildPrettyMessage({ body, bannerUrl, ping }) {
+/** Kembalikan "@everyone" / "@here" bila ada di teks, selain itu null. */
+function detectPing(text) {
+  const match = text.match(PING_PATTERN);
+  return match ? `@${match[1].toLowerCase()}` : null;
+}
+
+function previewHeader(draft) {
+  return `-# Preview, akan dikirim ke <#${draft.channelId}>`;
+}
+
+function previewFooter(draft) {
+  return `-# Message written by <@${draft.userId}>, not <@${client.user.id}>`;
+}
+
+function finalComponents(draft, withPing) {
   const container = new ContainerBuilder().setAccentColor(ACCENT_COLOR);
 
-  if (bannerUrl) {
+  if (draft.bannerUrl) {
     container.addMediaGalleryComponents(
-      new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(bannerUrl)),
+      new MediaGalleryBuilder().addItems(new MediaGalleryItemBuilder().setURL(draft.bannerUrl)),
     );
   }
 
-  container.addTextDisplayComponents(new TextDisplayBuilder().setContent(body));
+  container.addTextDisplayComponents(new TextDisplayBuilder().setContent(draft.text));
 
   const components = [];
-  if (ping) components.push(new TextDisplayBuilder().setContent(PING_TEXT));
+  if (withPing) components.push(new TextDisplayBuilder().setContent(detectPing(draft.text) ?? FALLBACK_PING));
   components.push(container);
 
   return components;
+}
+
+function previewPayload(draftId, draft) {
+  return {
+    flags: MessageFlags.IsComponentsV2 | MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+    components: [
+      new TextDisplayBuilder().setContent(previewHeader(draft)),
+      ...finalComponents(draft, detectPing(draft.text) !== null),
+      new TextDisplayBuilder().setContent(previewFooter(draft)),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`${SEND_PREFIX}${draftId}`)
+          .setLabel("Confirm Send")
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`${EDIT_PREFIX}${draftId}`)
+          .setLabel("Update Message")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  };
+}
+
+function assertTextBudget(text, overhead) {
+  const total = text.length + overhead;
+
+  if (total > MAX_TOTAL_TEXT) {
+    throw new UserFacingError(
+      `Isi pesan terlalu panjang: ${total} karakter dari semua TextDisplay, maksimal ${MAX_TOTAL_TEXT}. Pendekkan isi pesan lalu coba lagi.`,
+    );
+  }
+}
+
+/** Karakter yang dipakai header, footer, dan baris ping di preview. */
+function previewOverhead(draft) {
+  const ping = detectPing(draft.text);
+
+  return previewHeader(draft).length + previewFooter(draft).length + (ping ? ping.length : 0);
 }
 
 function permissionName(flag) {
@@ -128,6 +193,43 @@ function permissionName(flag) {
 
 function isValidBannerUrl(value) {
   return /^https?:\/\/\S+$/i.test(value);
+}
+
+function requireDraft(draftId, interaction) {
+  const draft = drafts.get(draftId);
+
+  if (!draft || draft.userId !== interaction.user.id || draft.guildId !== interaction.guildId) {
+    throw new UserFacingError("Draft kedaluwarsa. Jalankan /beautiful-message lagi.");
+  }
+
+  return draft;
+}
+
+function storeDraft(draftId, draft) {
+  drafts.set(draftId, draft);
+  setTimeout(() => drafts.delete(draftId), DRAFT_TTL_MS).unref();
+}
+
+function readDraftFromModal(interaction) {
+  const channelField = interaction.fields.getField(IDS.postChannel, ComponentType.ChannelSelect);
+  const channelId = channelField.values?.[0];
+
+  if (!channelId) {
+    throw new UserFacingError("Channel tujuan belum dipilih.");
+  }
+
+  const text = interaction.fields.getTextInputValue(IDS.messageBody).trim();
+  const bannerUrl = interaction.fields.getTextInputValue(IDS.bannerUrl).trim();
+
+  if (!text) {
+    throw new UserFacingError("Isi message body dulu sebelum mengirim.");
+  }
+
+  if (bannerUrl && !isValidBannerUrl(bannerUrl)) {
+    throw new UserFacingError("URL banner tidak valid. URL harus diawali `http://` atau `https://`.");
+  }
+
+  return { channelId, text, bannerUrl };
 }
 
 async function resolveTargetChannel(interaction, channelId) {
@@ -145,33 +247,8 @@ async function resolveTargetChannel(interaction, channelId) {
   return channel;
 }
 
-async function handleModalSubmit(interaction) {
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  if (!interaction.inCachedGuild() || !interaction.guild) {
-    throw new UserFacingError("Command ini hanya bisa dipakai di dalam server.");
-  }
-
-  const channelField = interaction.fields.getField(IDS.postChannel, ComponentType.ChannelSelect);
-  const channelId = channelField.values?.[0];
-
-  if (!channelId) {
-    throw new UserFacingError("Channel tujuan belum dipilih.");
-  }
-
-  const body = interaction.fields.getTextInputValue(IDS.messageBody).trim();
-  const bannerUrl = interaction.fields.getTextInputValue(IDS.bannerUrl).trim();
-
-  if (!body) {
-    throw new UserFacingError("Isi message body dulu sebelum mengirim.");
-  }
-
-  if (bannerUrl && !isValidBannerUrl(bannerUrl)) {
-    throw new UserFacingError("URL banner tidak valid. URL harus diawali `http://` atau `https://`.");
-  }
-
-  const channel = await resolveTargetChannel(interaction, channelId);
-  const me = interaction.guild.members.me;
+function checkBotPermissions(interaction, channel) {
+  const me = interaction.guild?.members.me;
 
   if (!me) {
     throw new UserFacingError("Member bot tidak ditemukan di server ini, kemungkinan cache belum siap.");
@@ -188,38 +265,87 @@ async function handleModalSubmit(interaction) {
     );
   }
 
-  const wantsPing = PING_PATTERN.test(body);
-  const canPing =
+  return botPermissions;
+}
+
+function resolvePing(draft, botPermissions, interaction) {
+  const wantsPing = detectPing(draft.text) !== null;
+
+  const allowed =
     wantsPing &&
     botPermissions.has(PermissionFlagsBits.MentionEveryone) &&
     (interaction.memberPermissions?.has(PermissionFlagsBits.MentionEveryone) ?? false);
-  const maxBodyLength = MAX_TOTAL_TEXT - (canPing ? PING_TEXT.length : 0);
 
-  if (body.length > maxBodyLength) {
-    throw new UserFacingError(
-      `Message body terlalu panjang: ${body.length} karakter. Maksimal ${maxBodyLength} karakter${
-        canPing ? " (termasuk penanda ping)" : ""
-      }.`,
-    );
+  return { wantsPing, allowed };
+}
+
+async function handleNewDraft(interaction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  if (!interaction.guildId) {
+    throw new UserFacingError("Command ini hanya bisa dipakai di dalam server.");
   }
 
-  const sent = await channel.send({
-    components: buildPrettyMessage({ body, bannerUrl, ping: canPing }),
+  const data = readDraftFromModal(interaction);
+  const draftId = interaction.id;
+  const draft = { userId: interaction.user.id, guildId: interaction.guildId, ...data };
+  assertTextBudget(draft.text, previewOverhead(draft));
+
+  storeDraft(draftId, draft);
+
+  await interaction.editReply(previewPayload(draftId, draft));
+}
+
+async function handleDraftUpdate(interaction, draftId) {
+  const draft = requireDraft(draftId, interaction);
+  const data = readDraftFromModal(interaction);
+
+  Object.assign(draft, data);
+
+  assertTextBudget(draft.text, previewOverhead(draft));
+
+  await interaction.update(previewPayload(draftId, draft));
+}
+
+async function handleEditDraft(interaction, draftId) {
+  const draft = requireDraft(draftId, interaction);
+
+  await interaction.showModal(buildModal(draftId, draft));
+}
+
+async function handleConfirmSend(interaction, draftId) {
+  const draft = requireDraft(draftId, interaction);
+
+  await interaction.deferUpdate();
+
+  const channel = await resolveTargetChannel(interaction, draft.channelId);
+  const botPermissions = checkBotPermissions(interaction, channel);
+  const { wantsPing, allowed } = resolvePing(draft, botPermissions, interaction);
+
+  assertTextBudget(draft.text, allowed ? detectPing(draft.text).length : 0);
+
+  const components = finalComponents(draft, allowed);
+
+  await channel.send({
+    components,
     flags: MessageFlags.IsComponentsV2,
-    allowedMentions: canPing ? { parse: ["everyone"] } : { parse: [] },
+    allowedMentions: allowed ? { parse: ["everyone"] } : { parse: [] },
   });
 
-  const notes = [];
-  if (wantsPing && !canPing) {
-    notes.push("Mention everyone tidak dikirim: izin `Mention Everyone` masih kurang.");
-  }
+  drafts.delete(draftId);
 
   await interaction.editReply({
-    content: [
-      `Pesan berhasil dikirim ke ${channel.toString()}. [Lihat pesan](${sent.url})`,
-      ...notes,
-    ].join("\n"),
+    flags: MessageFlags.IsComponentsV2,
+    allowedMentions: { parse: [] },
+    components: [new TextDisplayBuilder().setContent(`Terkirim ke ${channel}.`)],
   });
+
+  if (wantsPing && !allowed) {
+    await interaction.followUp({
+      content: "Mention everyone tidak dikirim: izin `Mention Everyone` masih kurang.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
 }
 
 async function registerGlobalCommands() {
@@ -231,15 +357,47 @@ async function registerGlobalCommands() {
   console.log(`Command /${COMMAND_NAME} terdaftar secara global.`);
 }
 
+async function respondWithError(interaction, content) {
+  if (interaction.deferred || interaction.replied) {
+    const isComponentsV2 = interaction.message?.flags?.has(MessageFlags.IsComponentsV2) ?? false;
+
+    await interaction.editReply(
+      isComponentsV2
+        ? {
+            flags: MessageFlags.IsComponentsV2,
+            components: [new TextDisplayBuilder().setContent(content)],
+          }
+        : { content },
+    );
+  } else if (interaction.isRepliable()) {
+    await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+  }
+}
+
 async function handleInteraction(interaction) {
   try {
     if (interaction.isChatInputCommand() && interaction.commandName === COMMAND_NAME) {
-      await interaction.showModal(buildModal());
+      await interaction.showModal(buildModal(NEW_REF));
       return;
     }
 
-    if (interaction.isModalSubmit() && interaction.customId === MODAL_ID) {
-      await handleModalSubmit(interaction);
+    if (interaction.isModalSubmit() && interaction.customId.startsWith(MODAL_PREFIX)) {
+      const ref = interaction.customId.slice(MODAL_PREFIX.length);
+
+      if (ref === NEW_REF) await handleNewDraft(interaction);
+      else await handleDraftUpdate(interaction, ref);
+
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith(SEND_PREFIX)) {
+      await handleConfirmSend(interaction, interaction.customId.slice(SEND_PREFIX.length));
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith(EDIT_PREFIX)) {
+      await handleEditDraft(interaction, interaction.customId.slice(EDIT_PREFIX.length));
+      return;
     }
   } catch (error) {
     const known = error instanceof UserFacingError;
@@ -250,11 +408,7 @@ async function handleInteraction(interaction) {
       : "Terjadi kesalahan tak terduga saat memproses permintaan. Coba lagi beberapa saat lagi.";
 
     try {
-      if (interaction.deferred || interaction.replied) {
-        await interaction.editReply({ content });
-      } else if (interaction.isRepliable()) {
-        await interaction.reply({ content, flags: MessageFlags.Ephemeral });
-      }
+      await respondWithError(interaction, content);
     } catch (replyError) {
       console.error("Gagal mengirim pesan error ke pengguna:", replyError);
     }
@@ -284,9 +438,11 @@ if (require.main === module) {
 
 module.exports = {
   client,
+  drafts,
   beautifulMessage,
   buildModal,
-  buildPrettyMessage,
-  handleModalSubmit,
+  finalComponents,
+  previewPayload,
+  detectPing,
   handleInteraction,
 };

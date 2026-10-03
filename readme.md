@@ -13,10 +13,50 @@ Dibangun dengan **discord.js v14 (CommonJS)** dan **Components V2**, jadi tidak 
   1. **Post Channel** — Channel Select Menu, hanya channel teks dan channel pengumuman
   2. **Message Body** — textarea, maksimal 4000 karakter
   3. **Banner Image URL** — opsional, harus diawali `http://` atau `https://`
+- **Preview dulu, kirim setelah dikonfirmasi.** Hasil akhir tampil di ephemeral preview, lengkap dengan tombol **Confirm Send** dan **Update Message**. Tidak ada yang terkirim ke channel sampai kamu menekan tombol konfirmasi.
 - Tata letak pesan: banner (MediaGallery) lalu teks (TextDisplay), dibungkus `ContainerBuilder` dengan accent color `0x5865f2`
 - Markdown dan emoji tetap jalan, karena isinya teks Discord biasa, bukan embed
 - `@everyone` atau `@here` otomatis jadi ping terpisah di atas kotak, **hanya** kalau bot dan pemakai command sama-sama punya izin Mention Everyone di channel tujuan
-- Izin bot dan batas panjang teks dicek sebelum kirim, dengan pesan error yang jelas
+- Izin bot dan batas panjang teks dicek ulang saat konfirmasi, dengan pesan error yang jelas
+
+---
+
+## Alur preview
+
+```
+/beautiful-message
+        │
+        ▼
+   Modal kosong  (customId: bm_modal:new)
+        │  submit
+        ▼
+   Draft disimpan di memori (14 menit)
+        │
+        ▼
+   Preview ephemeral ──► [Confirm Send]  ──► cek izin ──► kirim ke channel
+        │                       ▲
+        │                       │ interaction.update, pesan disalin di tempat
+        └── [Update Message] ───┘  modal terisi dari draft
+```
+
+Isi preview, berurutan dari atas:
+
+1. `-# Preview, akan dikirim ke <#channel>`
+2. Bentuk final pesan: banner di atas, teks di bawah, dalam satu container
+3. `-# Message written by <@kamu>, not <@bot>`
+4. Baris tombol: **Confirm Send** dan **Update Message**
+
+Preview tidak pernah membunyikan ping, karena `allowedMentions` di sana selalu `{ parse: [] }`. Baru setelah **Confirm Send** pesan dikirim sungguhan ke channel tujuan, lalu preview berubah menjadi `Terkirim ke <#channel>.`
+
+Kalau teks memuat `@everyone` tetapi izin Mention Everyone belum ada di channel tujuan, pesan tetap dikirim tanpa bunyi ping, dan kamu diberi tahu lewat pesan ephemeral terpisah.
+
+### Draft disimpan di memori
+
+Draft ditahan di `Map` di dalam RAM proses bot, bukan di database atau file. Konsekuensinya:
+
+- Draft **hilang saat bot restart**. Kalau bot mati di tengah preview, tombolnya jadi tidak berlaku dan kamu perlu menjalankan `/beautiful-message` lagi.
+- Draft **kedaluwarsa setelah 14 menit**.
+- Draft hanya bisa dibuka, diubah, atau dikirim oleh orang yang membuatnya. Kalau bot kamu punya lebih dari satu pengguna, tombol orang lain tidak akan bekerja untuk draft itu.
 
 ---
 
@@ -117,9 +157,13 @@ Butuh command yang langsung aktif di satu server? Daftarkan dengan `Routes.appli
    - Pilih channel tujuan (channel teks atau pengumuman).
    - Tulis isi pesan, boleh markdown dan emoji.
    - Isi URL banner kalau mau, kosongkan kalau tidak.
-4. Setelah dikirim, kamu dapat balasan konfirmasi **ephemeral** (hanya kamu yang lihat) berisi link ke pesan yang terkirim.
+4. Cek preview yang muncul. Kalau sudah pas, tekan **Confirm Send**.
+5. Kalau belum pas, tekan **Update Message**, ubah isinya di modal yang terbuka, lalu preview diperbarui di tempat yang sama tanpa bikin pesan baru.
+6. Setelah **Confirm Send**, preview berubah menjadi `Terkirim ke <#channel>.` dan tidak ada tombol lagi.
 
-Kalau teks memuat `@everyone` atau `@here` tetapi izin Mention Everyone belum ada di channel tujuan, pesan tetap terkirim tanpa bunyi ping dan kamu diberi tahu lewat balasan ephemeral itu.
+Preview bersifat **ephemeral**, jadi orang lain di server tidak melihatnya.
+
+Kalau teks memuat `@everyone` atau `@here` tetapi izin Mention Everyone belum ada di channel tujuan, pesan tetap terkirim tanpa bunyi ping dan kamu diberi tahu lewat pesan ephemeral terpisah.
 
 ---
 
@@ -133,6 +177,15 @@ beautiful-bot/
 ├── .gitignore
 └── README.md
 ```
+
+Fungsi utama di `index.js`:
+
+| Fungsi | Tugas |
+|---|---|
+| `buildModal(ref, draft)` | Modal kosong untuk `ref` = `new`, atau modal terisi dari draft saat update |
+| `finalComponents(draft, withPing)` | Bentuk pesan final: container dengan banner di atas teks, plus baris ping bila diizinkan |
+| `previewPayload(draftId, draft)` | Komponen preview lengkap beserta dua tombolnya |
+| `detectPing(text)` | Mengambil `@everyone` atau `@here` dari teks, kalau memang ada |
 
 ---
 
